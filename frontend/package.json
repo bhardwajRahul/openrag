@@ -77,6 +77,6 @@
     "typescript": "^5"
   },
   "lint-staged": {
-    "**/*.{js,ts,jsx,tsx,json,jsonc,css}": "biome check --write --files-ignore-unknown=true"
+    "**/*.{js,ts,jsx,tsx,css}": "biome check --write --files-ignore-unknown=true"
   }
 }
