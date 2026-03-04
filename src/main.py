@@ -668,58 +668,118 @@ async def refresh_default_openrag_docs(
     reason: str = "startup",
 ):
     """Refresh OpenRAG docs if remote content changed or when forced."""
-    if not _should_use_url_default_docs_ingest():
-        logger.info(
-            "Skipping OpenRAG docs refresh: URL ingestion is not active",
-            ingest_source=DEFAULT_DOCS_INGEST_SOURCE,
-            disable_langflow_ingest=DISABLE_INGEST_WITH_LANGFLOW,
-            has_url_ingest_flow_id=bool(LANGFLOW_URL_INGEST_FLOW_ID),
-            has_docs_url=bool(DEFAULT_DOCS_URL),
-        )
-        return False
-
-    config = get_openrag_config()
-    if not config.edited:
-        logger.info("Skipping OpenRAG docs refresh: onboarding not completed")
-        return False
-
-    signature = await _get_remote_docs_signature(DEFAULT_DOCS_URL)
-    if not signature and not force:
-        return False
-
-    previous_signature = config.onboarding.openrag_docs_remote_signature
-    should_refresh = force or (signature is not None and signature != previous_signature)
-    if not should_refresh:
-        logger.info(
-            "OpenRAG docs refresh skipped: remote signature unchanged",
-            signature=signature,
-        )
-        return False
-
-    logger.info(
-        "Refreshing default OpenRAG docs",
-        reason=reason,
-        force=force,
-        previous_signature=previous_signature,
-        new_signature=signature,
+    await TelemetryClient.send_event(
+        Category.DOCUMENT_INGESTION,
+        MessageId.ORB_DOC_REFRESH_START,
+        metadata={"reason": reason, "force": force},
     )
-    await _delete_existing_default_docs(session_manager)
-    await ingest_default_documents_when_ready(
-        document_service,
-        task_service,
-        langflow_file_service,
-        session_manager,
-    )
-    config.onboarding.openrag_docs_ingested_version = OPENRAG_VERSION
-    if signature:
+    try:
+        if not _should_use_url_default_docs_ingest():
+            logger.info(
+                "Skipping OpenRAG docs refresh: URL ingestion is not active",
+                ingest_source=DEFAULT_DOCS_INGEST_SOURCE,
+                disable_langflow_ingest=DISABLE_INGEST_WITH_LANGFLOW,
+                has_url_ingest_flow_id=bool(LANGFLOW_URL_INGEST_FLOW_ID),
+                has_docs_url=bool(DEFAULT_DOCS_URL),
+            )
+            await TelemetryClient.send_event(
+                Category.DOCUMENT_INGESTION,
+                MessageId.ORB_DOC_REFRESH_SKIPPED,
+                metadata={
+                    "reason": reason,
+                    "force": force,
+                    "skip_reason": "url_ingestion_inactive",
+                },
+            )
+            return False
+
+        config = get_openrag_config()
+        if not config.edited:
+            logger.info("Skipping OpenRAG docs refresh: onboarding not completed")
+            await TelemetryClient.send_event(
+                Category.DOCUMENT_INGESTION,
+                MessageId.ORB_DOC_REFRESH_SKIPPED,
+                metadata={
+                    "reason": reason,
+                    "force": force,
+                    "skip_reason": "onboarding_not_completed",
+                },
+            )
+            return False
+
+        signature = await _get_remote_docs_signature(DEFAULT_DOCS_URL)
+        if not signature and not force:
+            await TelemetryClient.send_event(
+                Category.DOCUMENT_INGESTION,
+                MessageId.ORB_DOC_REFRESH_SKIPPED,
+                metadata={
+                    "reason": reason,
+                    "force": force,
+                    "skip_reason": "signature_unavailable",
+                },
+            )
+            return False
+
+        previous_signature = config.onboarding.openrag_docs_remote_signature
+        should_refresh = force or (signature is not None and signature != previous_signature)
+        if not should_refresh:
+            logger.info(
+                "OpenRAG docs refresh skipped: remote signature unchanged",
+                signature=signature,
+            )
+            await TelemetryClient.send_event(
+                Category.DOCUMENT_INGESTION,
+                MessageId.ORB_DOC_REFRESH_SKIPPED,
+                metadata={
+                    "reason": reason,
+                    "force": force,
+                    "skip_reason": "signature_unchanged",
+                },
+            )
+            return False
+
+        logger.info(
+            "Refreshing default OpenRAG docs",
+            reason=reason,
+            force=force,
+            previous_signature=previous_signature,
+            new_signature=signature,
+        )
+        await _delete_existing_default_docs(session_manager)
+        await ingest_default_documents_when_ready(
+            document_service,
+            task_service,
+            langflow_file_service,
+            session_manager,
+        )
+        config.onboarding.openrag_docs_ingested_version = OPENRAG_VERSION
+        # Keep docs version/signature metadata consistent after a refresh.
+        # If signature retrieval failed, persist None explicitly instead of
+        # leaving a stale previous signature value.
         config.onboarding.openrag_docs_remote_signature = signature
-    if not config_manager.save_config_file(config):
-        logger.warning(
-            "OpenRAG docs refreshed but failed to persist metadata",
-            version=config.onboarding.openrag_docs_ingested_version,
-            signature=config.onboarding.openrag_docs_remote_signature,
+        if not config_manager.save_config_file(config):
+            logger.warning(
+                "OpenRAG docs refreshed but failed to persist metadata",
+                version=config.onboarding.openrag_docs_ingested_version,
+                signature=config.onboarding.openrag_docs_remote_signature,
+            )
+        await TelemetryClient.send_event(
+            Category.DOCUMENT_INGESTION,
+            MessageId.ORB_DOC_REFRESH_COMPLETE,
+            metadata={"reason": reason, "force": force},
         )
-    return True
+        return True
+    except Exception as e:
+        await TelemetryClient.send_event(
+            Category.DOCUMENT_INGESTION,
+            MessageId.ORB_DOC_REFRESH_FAILED,
+            metadata={
+                "reason": reason,
+                "force": force,
+                "error_type": type(e).__name__,
+            },
+        )
+        raise
 
 async def health_check(request: Request):
     """Simple liveness probe: Indicates that the OpenRAG Backend service is online and running."""
