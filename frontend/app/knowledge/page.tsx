@@ -107,7 +107,7 @@ function SearchPage() {
     return file?.connector_type === "system_default";
   }, []);
 
-  const hasOpenragRefreshCue = tasks.some((task) => {
+  const hasOpenragRefreshCueFromTasks = tasks.some((task) => {
     const isTaskActive =
       task.status === "pending" ||
       task.status === "running" ||
@@ -119,10 +119,13 @@ function SearchPage() {
     return Object.entries(task.files).some(([fileKey, fileInfo]) => {
       const filename = (fileInfo as { filename?: string })?.filename ?? "";
       return (
-        filename === "OpenRAG docs refresh" || fileKey.includes("docs.openr.ag")
+        filename === "OpenRAG docs refresh" ||
+        fileKey.includes("openr.ag")
       );
     });
   });
+  const hasOpenragRefreshCue =
+    refreshOpenragDocsMutation.isPending || hasOpenragRefreshCueFromTasks;
 
   // Show toast notification for search errors
   useEffect(() => {
@@ -180,7 +183,7 @@ function SearchPage() {
     // The table should only show indexed docs, not orchestration task labels.
     if (
       taskFile.filename === "OpenRAG docs refresh" ||
-      taskFile.source_url.includes("docs.openr.ag")
+      taskFile.source_url.includes("openr.ag")
     ) {
       return false;
     }
@@ -198,6 +201,28 @@ function SearchPage() {
   });
   // Combine task files first, then backend files
   const fileResults = [...backendFiles, ...filteredTaskFiles];
+  const hasOpenragDocsEntry = fileResults.some(
+    (file) => file.connector_type === "system_default",
+  );
+  const isDefaultKnowledgeView =
+    !queryOverride || queryOverride.trim().length === 0 || queryOverride === "*";
+  const shouldShowDefaultOpenragPlaceholder =
+    isDefaultKnowledgeView &&
+    !isFetching &&
+    !hasOpenragDocsEntry &&
+    fileResults.length === 0;
+
+  const placeholderOpenragDoc: File = {
+    filename: "What is OpenRAG docs",
+    mimetype: "text/markdown",
+    source_url: "https://www.openr.ag/",
+    size: 0,
+    connector_type: "system_default",
+    status: "unavailable",
+  };
+  const gridRows = shouldShowDefaultOpenragPlaceholder
+    ? [placeholderOpenragDoc]
+    : fileResults;
   const gridRef = useRef<AgGridReact>(null);
 
   const columnDefs: ColDef<File>[] = [
@@ -567,7 +592,7 @@ function SearchPage() {
           loading={isFetching}
           ref={gridRef}
           theme={themeQuartz.withParams({ browserColorScheme: "inherit" })}
-          rowData={fileResults}
+          rowData={gridRows}
           rowSelection="multiple"
           rowMultiSelectWithClick={false}
           suppressRowClickSelection={true}

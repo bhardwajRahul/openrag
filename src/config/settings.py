@@ -65,7 +65,7 @@ INGEST_SAMPLE_DATA = os.getenv(
 # - "url": crawl DEFAULT_DOCS_URL with URL ingestion flow
 # - "files": ingest files from the openrag-documents directory
 DEFAULT_DOCS_INGEST_SOURCE = os.getenv("DEFAULT_DOCS_INGEST_SOURCE", "url").lower()
-DEFAULT_DOCS_URL = os.getenv("DEFAULT_DOCS_URL", "https://docs.openr.ag")
+DEFAULT_DOCS_URL = os.getenv("DEFAULT_DOCS_URL", "https://www.openr.ag/")
 DEFAULT_DOCS_CRAWL_DEPTH = get_env_int("DEFAULT_DOCS_CRAWL_DEPTH", 2)
 FETCH_OPENRAG_DOCS_AT_STARTUP = os.getenv(
     "FETCH_OPENRAG_DOCS_AT_STARTUP", "false"

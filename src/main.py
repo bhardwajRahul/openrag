@@ -2,9 +2,12 @@ from utils.version_utils import OPENRAG_VERSION
 import asyncio
 import atexit
 import hashlib
+import html
 import httpx
 import os
+import re
 import subprocess
+import tempfile
 
 # Configure structured logging early
 from connectors.langflow_connector_service import LangflowConnectorService
@@ -361,12 +364,7 @@ def _get_documents_dir():
 
 def _should_use_url_default_docs_ingest() -> bool:
     """Return whether default docs ingestion should use URL crawling."""
-    return (
-        DEFAULT_DOCS_INGEST_SOURCE == "url"
-        and not DISABLE_INGEST_WITH_LANGFLOW
-        and bool(LANGFLOW_URL_INGEST_FLOW_ID)
-        and bool(DEFAULT_DOCS_URL)
-    )
+    return DEFAULT_DOCS_INGEST_SOURCE == "url" and bool(DEFAULT_DOCS_URL)
 
 
 async def ingest_default_documents_when_ready(
@@ -383,18 +381,9 @@ async def ingest_default_documents_when_ready(
             Category.DOCUMENT_INGESTION, MessageId.ORB_DOC_DEFAULT_START
         )
         use_url_ingest = _should_use_url_default_docs_ingest()
-        if (
-            DEFAULT_DOCS_INGEST_SOURCE == "url"
-            and not DISABLE_INGEST_WITH_LANGFLOW
-            and not LANGFLOW_URL_INGEST_FLOW_ID
-        ):
-            logger.warning(
-                "URL docs ingestion flow id is missing; falling back to file-based default ingestion",
-                ingest_source=DEFAULT_DOCS_INGEST_SOURCE,
-            )
         if use_url_ingest:
             await _ingest_default_documents_url(
-                session_manager=session_manager,
+                document_service=document_service,
                 docs_url=DEFAULT_DOCS_URL,
                 crawl_depth=DEFAULT_DOCS_CRAWL_DEPTH,
             )
@@ -453,7 +442,6 @@ async def _ingest_default_documents_langflow(
 
     # Use AnonymousUser details for default documents
     from session_manager import AnonymousUser
-
     anonymous_user = AnonymousUser()
 
     # Get JWT token using same logic as DocumentFileProcessor
@@ -507,70 +495,108 @@ async def _ingest_default_documents_langflow(
 
 
 async def _ingest_default_documents_url(
-    session_manager, docs_url: str, crawl_depth: int
+    document_service,
+    docs_url: str,
+    crawl_depth: int,
 ):
-    """Ingest default docs by crawling a URL with the Langflow URL ingest flow."""
-    if not LANGFLOW_URL_INGEST_FLOW_ID:
-        raise ValueError("LANGFLOW_URL_INGEST_FLOW_ID is not configured")
+    """Ingest default docs from URL using OpenRAG ingestion logic (no Langflow)."""
     if not docs_url:
         raise ValueError("DEFAULT_DOCS_URL is not configured")
 
-    from session_manager import AnonymousUser
-    from utils.langflow_headers import add_provider_credentials_to_headers
-    from config.settings import get_openrag_config
-
-    anonymous_user = AnonymousUser()
-    effective_jwt = None
-    if session_manager:
-        session_manager.get_user_opensearch_client(
-            anonymous_user.user_id, effective_jwt
-        )
-        if hasattr(session_manager, "_anonymous_jwt"):
-            effective_jwt = session_manager._anonymous_jwt
-
-    payload = {
-        "input_value": docs_url,
-        "input_type": "chat",
-        "output_type": "text",
-        "tweaks": {
-            "URLComponent-lnA0q": {
-                "urls": [docs_url],
-                "max_depth": crawl_depth,
-                "prevent_outside": True,
-            }
-        },
-    }
-    config = get_openrag_config()
-    headers = {
-        "X-Langflow-Global-Var-JWT": str(effective_jwt) if effective_jwt else "",
-        "X-Langflow-Global-Var-OWNER": "",
-        "X-Langflow-Global-Var-OWNER_NAME": str(anonymous_user.name),
-        "X-Langflow-Global-Var-OWNER_EMAIL": str(anonymous_user.email),
-        "X-Langflow-Global-Var-CONNECTOR_TYPE": "system_default",
-        "X-Langflow-Global-Var-SELECTED_EMBEDDING_MODEL": str(
-            config.knowledge.embedding_model
-        ),
-    }
-    add_provider_credentials_to_headers(headers, config)
-
     logger.info(
-        "Running default URL docs ingestion flow",
+        "Running default URL docs ingestion with OpenRAG processor",
         docs_url=docs_url,
         crawl_depth=crawl_depth,
     )
-    resp = await clients.langflow_request(
-        "POST",
-        f"/api/v1/run/{LANGFLOW_URL_INGEST_FLOW_ID}",
-        json=payload,
-        headers=headers,
+    temp_file_path = await _materialize_default_docs_url_as_text_file(
+        docs_url=docs_url,
+        crawl_depth=crawl_depth,
     )
-    if resp.status_code >= 400:
-        logger.error(
-            "Default URL docs ingestion failed",
-            status_code=resp.status_code,
-            body=resp.text[:1000],
+    try:
+        from models.processors import DocumentFileProcessor
+        from utils.hash_utils import hash_id
+
+        processor = DocumentFileProcessor(
+            document_service,
+            owner_user_id=None,
+            jwt_token=None,
+            owner_name=None,
+            owner_email=None,
+            is_sample_data=True,
+            connector_type="system_default",
         )
-        resp.raise_for_status()
+        await processor.process_document_standard(
+            file_path=temp_file_path,
+            file_hash=hash_id(temp_file_path),
+            owner_user_id=None,
+            original_filename="openrag-url-default.txt",
+            jwt_token=None,
+            owner_name=None,
+            owner_email=None,
+            file_size=os.path.getsize(temp_file_path),
+            connector_type="system_default",
+            is_sample_data=True,
+        )
+    finally:
+        try:
+            os.unlink(temp_file_path)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.warning(
+                "Failed to clean temporary default URL docs file",
+                path=temp_file_path,
+                error=str(e),
+            )
+
+
+async def _materialize_default_docs_url_as_text_file(
+    docs_url: str,
+    crawl_depth: int,
+) -> str:
+    """Fetch URL content and write a temporary text file for OpenRAG ingestion."""
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        response = await client.get(docs_url)
+        response.raise_for_status()
+        raw_html = response.text
+
+    title_match = re.search(
+        r"<title[^>]*>(.*?)</title>", raw_html, flags=re.IGNORECASE | re.DOTALL
+    )
+    title = html.unescape(title_match.group(1).strip()) if title_match else "OpenRAG"
+
+    no_scripts = re.sub(
+        r"<script[^>]*>.*?</script>",
+        " ",
+        raw_html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    no_styles = re.sub(
+        r"<style[^>]*>.*?</style>",
+        " ",
+        no_scripts,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    text_only = re.sub(r"<[^>]+>", " ", no_styles)
+    normalized_text = re.sub(r"\s+", " ", html.unescape(text_only)).strip()
+
+    content = (
+        f"{title}\n\n"
+        f"Source URL: {docs_url}\n"
+        f"Crawl depth: {crawl_depth}\n\n"
+        f"{normalized_text}\n"
+    )
+
+    temp_file = tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".txt",
+        prefix="openrag-url-default-",
+        delete=False,
+        encoding="utf-8",
+    )
+    with temp_file:
+        temp_file.write(content)
+    return temp_file.name
 
 
 async def _delete_existing_default_docs(session_manager):
@@ -882,7 +908,9 @@ async def opensearch_health_ready(request):
         )
 
 
-async def _ingest_default_documents_openrag(document_service, task_service, file_paths):
+async def _ingest_default_documents_openrag(
+    document_service, task_service, file_paths, connector_type: str = "local"
+):
     """Ingest default documents using traditional OpenRAG processor."""
     logger.info(
         "Using traditional OpenRAG ingestion for default documents",
@@ -899,6 +927,7 @@ async def _ingest_default_documents_openrag(document_service, task_service, file
         owner_name=None,
         owner_email=None,
         is_sample_data=True,  # Mark as sample data
+        connector_type=connector_type,
     )
 
     task_id = await task_service.create_custom_task("anonymous", file_paths, processor)
